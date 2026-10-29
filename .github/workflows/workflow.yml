@@ -1,0 +1,44 @@
+name: Task Flow
+
+on:
+  workflow_dispatch:
+    inputs:
+      m:
+        description: "mode"
+        default: "a"
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: s1
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC }}
+          token: ${{ secrets.READ_KEY }}
+
+      - name: s2
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: s3
+        id: i
+        run: python -m pip install -r deps.txt > /dev/null 2>&1
+
+      - name: s4
+        id: r
+        env:
+          M: ${{ inputs.m }}
+        run: python main.py "$M" > /dev/null 2>&1
+
+      - name: s5
+        run: test -s out.txt && echo "R:1"
+
+      - name: s6
+        if: failure()
+        run: echo "E:${{ steps.i.outcome }}:${{ steps.r.outcome }}"
