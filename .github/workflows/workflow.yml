@@ -29,30 +29,6 @@ jobs:
           set +e
           fail() { echo "E:$1${2:+:$2}"; exit 1; }
 
-          # --- 診断用スクリプト（名前・値は一切出さない。長さ・一致の真偽・件数だけ出す）---
-          cat > "$RUNNER_TEMP/g.py" <<'PY'
-          import json,sys
-          def load(p):
-              try:
-                  return json.load(open(p))
-              except Exception:
-                  return None
-          l=load(sys.argv[1]); u=load(sys.argv[2]); s=sys.argv[3]
-          login=u.get("login","") if isinstance(u,dict) else ""
-          rows=l if isinstance(l,list) else []
-          names=[x.get("full_name","") for x in rows]
-          priv=[x for x in rows if x.get("private")]
-          o,_,r=s.partition("/")
-          if isinstance(l,dict): print("g:list_msg=%s" % l.get("message"))
-          if isinstance(u,dict) and not login: print("g:user_msg=%s" % u.get("message"))
-          print("g:src:len=%d:slash=%d:ascii=%s:owner_len=%d:repo_len=%d" % (len(s), s.count("/"), s.isascii(), len(o), len(r)))
-          print("g:login_len=%d:owner_eq_login=%s:owner_eq_login_ci=%s" % (len(login), o==login, o.lower()==login.lower()))
-          print("g:visible=%d:private=%d:src_in_visible=%s:src_in_visible_ci=%s" % (len(rows), len(priv), s in names, s.lower() in [n.lower() for n in names]))
-          for i,x in enumerate(priv[:5]):
-              a,_,b=x.get("full_name","").partition("/")
-              print("g:p%d:owner_len=%d:repo_len=%d:branch_set=%s:size=%s" % (i,len(a),len(b),bool(x.get("default_branch")),x.get("size")))
-          PY
-
           # --- 値の整形（空白・改行、URL形式、.git を取り除く）---
           s=$(printf '%s' "$SRC" | tr -d '[:space:]')
           s=${s#https://github.com/}
@@ -86,7 +62,6 @@ jobs:
             for r in $cands; do
               a1=$(curl -s -o /dev/null -w '%{http_code}' "${h[@]}" "https://api.github.com/repos/$r/contents/main.py")
               a2=$(curl -s -o /dev/null -w '%{http_code}' "${h[@]}" "https://api.github.com/repos/$r/contents/deps.txt")
-              echo "x:probe:main=$a1:deps=$a2"
               if [ "$a1" = "200" ] && [ "$a2" = "200" ]; then cnt=$((cnt+1)); pick=$r; fi
             done
             echo "x:cand=$cnt"
@@ -97,12 +72,6 @@ jobs:
             c=$(curl -s -o /dev/null -w '%{http_code}' "${h[@]}" "https://api.github.com/repos/$s")
             t=$(curl -s -o /dev/null -w '%{http_code}' "${h[@]}" "https://api.github.com/rate_limit")
             echo "d:repo=$c:key=$t:kind=$(case "$k" in "") echo empty;; github_pat_*) echo fg;; ghp_*) echo classic;; *) echo other;; esac)"
-            # --- 診断（原因特定用。直し込みはしない）---
-            echo "g:raw:src_len=${#SRC}:key_len=${#K} / trimmed:src_len=${#s}:key_len=${#k}"
-            u=$(curl -s -o "$RUNNER_TEMP/u.json" -w '%{http_code}' "${h[@]}" "https://api.github.com/user")
-            echo "g:user=$u"
-            curl -s -D - -o /dev/null "${h[@]}" "https://api.github.com/repos/$s" | tr -d '\r' | grep -i -E '^(x-accepted-github-permissions|github-authentication-token-expiration):' | sed 's/^/g:h:/'
-            python "$RUNNER_TEMP/g.py" "$RUNNER_TEMP/l.json" "$RUNNER_TEMP/u.json" "$s" 2>/dev/null
             fail 1
           fi
           rm -rf .git

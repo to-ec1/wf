@@ -1,0 +1,163 @@
+name: Leak Check
+
+# 手動で1回押すだけ。Task Flow を a と b の2通り自動で動かし、
+# 完了を待ち、ログを取得し、禁止ワードを検査して、結果を1つのログにまとめる。
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: l1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORDS: ${{ secrets.WORDS }}
+        run: |
+          set +e
+          R="$GH_REPO"
+          say() { echo "L:$*"; }
+          overall=0
+          ids=""
+
+          # --- 検査用の小さなプログラム（ワード・該当行の中身は一切出さない）---
+          cat > "$RUNNER_TEMP/c.py" <<'PY'
+          import glob, os, re, sys
+          d, mode, want = sys.argv[1], sys.argv[2], sys.argv[3]
+          words = os.environ.get("WORDS", "").split()
+          pats = []
+          for w in words:
+              if len(w) <= 2:
+                  pats.append(re.compile(r"(?<![A-Za-z0-9])" + re.escape(w) + r"(?![A-Za-z0-9])", re.I))
+              else:
+                  pats.append(re.compile(re.escape(w), re.I))
+          files = sorted(f for f in glob.glob(d + "/**/*", recursive=True) if os.path.isfile(f))
+          lines = 0
+          hits = 0
+          marker = "none"
+          for f in files:
+              text = open(f, encoding="utf-8-sig", errors="replace").read().splitlines()
+              lines += len(text)
+              h = 0
+              for ln in text:
+                  if any(p.search(ln) for p in pats):
+                      h += 1
+                  m = re.search(r"Z (R:\d|E:\d+(?::\S+)?)$", ln)
+                  if m:
+                      marker = m.group(1)
+              if h:
+                  print("L:mode=%s:hit:file=%s:count=%d" % (mode, os.path.relpath(f, d), h))
+              hits += h
+          ok_marker = (marker == want)
+          print("L:mode=%s:words=%d:files=%d:lines=%d:hits=%d:marker=%s:marker_expected=%s:marker_ok=%s" % (mode, len(words), len(files), lines, hits, marker, want, ok_marker))
+          good = (hits == 0 and len(words) > 0 and ok_marker)
+          print("L:mode=%s:%s" % (mode, "OK" if good else "NG"))
+          raise SystemExit(0 if good else 1)
+          PY
+
+          # --- 禁止ワード未登録でも、他の確認は最後まで進める ---
+          if [ -z "$WORDS" ]; then say "words=EMPTY（Secrets の WORDS が未登録。ワード検査は不可、取得と動作確認だけ実施）"; overall=1; fi
+
+          # --- 今回の実行を見つける（開始時刻より後に作られた workflow_dispatch の Task Flow）---
+          find_run() {
+            local i id
+            for i in $(seq 1 24); do
+              id=$(gh run list -w "Task Flow" --event workflow_dispatch -L 10 --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$1\")] | sort_by(.createdAt) | .[-1].databaseId // empty" 2>/dev/null)
+              if [ -n "$id" ]; then echo "$id"; return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+
+          # --- 完了まで待つ（最大20分）---
+          wait_done() {
+            local i st
+            for i in $(seq 1 120); do
+              st=$(gh run view "$1" --json status,conclusion -q '.status+":"+(.conclusion//"")' 2>/dev/null)
+              case "$st" in completed:*) echo "$st"; return 0;; esac
+              sleep 10
+            done
+            echo "timeout:$st"; return 1
+          }
+
+          # --- ログ取得：方法1(zip) → 方法2(転送先URL直取り) → 方法3(ジョブ別) を各4回まで ---
+          fetch_logs() {
+            local id="$1" d="$2" t loc code jobs j okj
+            FETCH_DIAG=""
+            for t in 1 2 3 4; do
+              rm -rf "$d" "$d.zip"; mkdir -p "$d"
+              if gh api "repos/$R/actions/runs/$id/logs" > "$d.zip" 2> "$d.err" && unzip -tq "$d.zip" > /dev/null 2>&1; then
+                unzip -q "$d.zip" -d "$d"; FETCH_METHOD="m1:try$t"; return 0
+              fi
+              FETCH_DIAG="$FETCH_DIAG [t$t m1:$(head -c 50 "$d.err" | tr -c 'A-Za-z0-9 .:()_-' '_')]"
+
+              loc=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$R/actions/runs/$id/logs")
+              code=${loc%% *}; loc=${loc#* }
+              if [ "$code" = "302" ] && [ -n "$loc" ]; then
+                curl -sL "$loc" -o "$d.zip"
+                if unzip -tq "$d.zip" > /dev/null 2>&1; then unzip -q "$d.zip" -d "$d"; FETCH_METHOD="m2:try$t"; return 0; fi
+              fi
+              FETCH_DIAG="$FETCH_DIAG [t$t m2:http=$code]"
+
+              jobs=$(gh api "repos/$R/actions/runs/$id/jobs" -q '.jobs[].id' 2>/dev/null)
+              okj=0
+              for j in $jobs; do
+                if gh api "repos/$R/actions/jobs/$j/logs" > "$d/job_$j.txt" 2>/dev/null && [ -s "$d/job_$j.txt" ]; then okj=$((okj+1)); else rm -f "$d/job_$j.txt"; fi
+              done
+              if [ "$okj" -gt 0 ]; then FETCH_METHOD="m3:try$t:jobs=$okj"; return 0; fi
+              FETCH_DIAG="$FETCH_DIAG [t$t m3:jobs=$(echo $jobs | wc -w):ok=0]"
+              sleep $((t*5))
+            done
+            return 1
+          }
+
+          # --- 取得に全部失敗した時：原因が1回で分かるよう情報をまとめて出す ---
+          diag_fail() {
+            say "mode=$2:diag:run=$1$FETCH_DIAG"
+            gh api "repos/$R/actions/runs/$1" -q '"L:diag:status=\(.status):conclusion=\(.conclusion):attempt=\(.run_attempt)"' 2>&1 | head -c 200
+            echo
+            curl -s -D - -o /dev/null -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$R/actions/runs/$1/logs" | tr -d '\r' | grep -i -E '^(HTTP/|x-accepted-github-permissions|x-ratelimit-remaining)' | sed 's/^/L:diag:h:/'
+            gh api "repos/$R/actions/runs/$1/jobs" -q '"L:diag:jobs=\(.jobs|length)"' 2>&1 | head -c 100
+            echo
+          }
+
+          # --- 本体：a（成功するはず）と b（わざと失敗するはず）を順に実行して検査 ---
+          for M in a b; do
+            want_c=success; want_m="R:1"
+            if [ "$M" = "b" ]; then want_c=failure; want_m="E:4"; fi
+            before=$(date -u -d '-5 seconds' +%Y-%m-%dT%H:%M:%SZ)
+            say "mode=$M:dispatch"
+            if ! gh workflow run "Task Flow" -f m="$M" 2> "$RUNNER_TEMP/e.txt"; then
+              say "mode=$M:E:dispatch:$(head -c 80 "$RUNNER_TEMP/e.txt" | tr -c 'A-Za-z0-9 .:()_-' '_')"; overall=1; continue
+            fi
+            id=$(find_run "$before")
+            if [ -z "$id" ]; then say "mode=$M:E:run_not_found"; overall=1; continue; fi
+            ids="$ids $id"
+            st=$(wait_done "$id")
+            say "mode=$M:run=$id:state=$st:expected_conclusion=$want_c"
+            if [ "${st#completed:}" != "$want_c" ]; then say "mode=$M:MISMATCH_conclusion"; overall=1; fi
+            if fetch_logs "$id" "$RUNNER_TEMP/log_$M"; then
+              say "mode=$M:logs=ok:method=$FETCH_METHOD"
+              python3 "$RUNNER_TEMP/c.py" "$RUNNER_TEMP/log_$M" "$M" "$want_m" || overall=1
+            else
+              say "mode=$M:logs=FAILED"; diag_fail "$id" "$M"; overall=1
+            fi
+          done
+
+          # --- 後片付け：全部OKの時だけ、このテストで作った Task Flow の実行(a,b)を削除。NGなら調査用に残す ---
+          if [ "$overall" = "0" ]; then
+            for i in $ids; do
+              if gh run delete "$i" > /dev/null 2>&1; then say "cleanup:deleted=$i"; else say "cleanup:failed=$i"; fi
+            done
+          else
+            say "cleanup:skipped（NGのため、調査用に実行履歴を残しました:$ids）"
+          fi
+
+          if [ "$overall" = "0" ]; then say "ALL_OK"; else say "ALL_NG"; fi
+          exit $overall
