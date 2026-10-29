@@ -16,29 +16,48 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: s1
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ secrets.SRC }}
-          token: ${{ secrets.READ_KEY }}
-
-      - name: s2
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: s3
-        id: i
-        run: python -m pip install -r deps.txt > /dev/null 2>&1
-
-      - name: s4
-        id: r
+      - name: s2
         env:
+          SRC: ${{ secrets.SRC }}
+          K: ${{ secrets.READ_KEY }}
           M: ${{ inputs.m }}
-        run: python main.py "$M" > /dev/null 2>&1
+        run: |
+          set +e
+          fail() { echo "E:$1${2:+:$2}"; exit 1; }
 
-      - name: s5
-        run: test -s out.txt && echo "R:1"
+          # --- 値の整形（貼り付け時の空白・改行、URL形式、.git を取り除く）---
+          s=$(printf '%s' "$SRC" | tr -d '[:space:]')
+          s=${s#https://github.com/}
+          s=${s%.git}
+          k=$(printf '%s' "$K" | tr -d '[:space:]')
+          h=(-H "Authorization: Bearer $k" -H "Accept: application/vnd.github+json")
 
-      - name: s6
-        if: failure()
-        run: echo "E:${{ steps.i.outcome }}:${{ steps.r.outcome }}"
+          # --- 手順1：非公開リポジトリが読めるか確認（数字だけ表示。値は表示しない）---
+          c=$(curl -s -o /dev/null -w '%{http_code}' "${h[@]}" "https://api.github.com/repos/$s")
+          if [ "$c" != "200" ]; then
+            t=$(curl -s -o /dev/null -w '%{http_code}' "${h[@]}" "https://api.github.com/rate_limit")
+            curl -s "${h[@]}" "https://api.github.com/user/repos?per_page=100" > "$RUNNER_TEMP/l.json"
+            nq=$(python -c 'import json,sys;t=open(sys.argv[1]).read().strip();ok=t.startswith("[");d=json.loads(t) if ok else [];print(len(d) if ok else -1,sum(1 for x in d if str(x.get("name","")).lower()==sys.argv[2].lower()) if ok else -1)' "$RUNNER_TEMP/l.json" "${s##*/}" 2>/dev/null)
+            n=${nq% *}
+            q=${nq#* }
+            echo "d:repo=$c:key=$t:visible=$n:samename=$q:slash=$(printf '%s' "$s" | tr -cd '/' | wc -c):kind=$(case "$k" in "") echo empty;; github_pat_*) echo fg;; ghp_*) echo classic;; *) echo other;; esac)"
+            fail 1
+          fi
+
+          # --- 手順2：コードを取り込む（再試行しない。トークンは取り込み後に消す）---
+          git clone -q --depth 1 "https://x-access-token:${k}@github.com/${s}.git" . > /dev/null 2>&1 || fail 2
+          rm -rf .git
+
+          # --- 手順3：ライブラリを入れる ---
+          python -m pip install -q -r deps.txt > /dev/null 2>&1 || fail 3
+
+          # --- 手順4：実行（出力は全部捨てる）---
+          python main.py "$M" > /dev/null 2>&1 || fail 4
+
+          # --- 手順5：結果側の確認（本当に動いた時だけ out.txt ができる）---
+          test -s out.txt || fail 5
+          echo "R:1"
