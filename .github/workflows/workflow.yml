@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: s1
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
 
@@ -24,9 +24,24 @@ jobs:
         env:
           SRC: ${{ secrets.SRC }}
           K: ${{ secrets.READ_KEY }}
+          BANK_URL: ${{ secrets.BANK_URL }}
+          BANK_PASSWORD: ${{ secrets.BANK_PASSWORD }}
+          BANK_PROJECT: ${{ secrets.BANK_PROJECT }}
+          SHEET_API_URL: ${{ secrets.SHEET_API_URL }}
+          SHEET_API_PASSWORD: ${{ secrets.SHEET_API_PASSWORD }}
           M: ${{ inputs.m }}
         run: |
           set +e
+
+          # --- 全Secretsを動的マスク（万が一の出力漏れを二重防御）---
+          echo "::add-mask::$SRC"
+          echo "::add-mask::$K"
+          echo "::add-mask::$BANK_URL"
+          echo "::add-mask::$BANK_PASSWORD"
+          echo "::add-mask::$BANK_PROJECT"
+          echo "::add-mask::$SHEET_API_URL"
+          echo "::add-mask::$SHEET_API_PASSWORD"
+
           fail() { echo "E:$1${2:+:$2}"; exit 1; }
 
           # --- 値の整形（空白・改行、URL形式、.git を取り除く）---
